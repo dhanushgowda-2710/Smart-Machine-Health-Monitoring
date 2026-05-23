@@ -1,0 +1,160 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ThingSpeak.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#define ONE_WIRE_BUS 4
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+//THINGSPEAK 
+unsigned long channelID = YOUR_CHANNEL_ID;
+const char* writeAPIKey = "YOUR_THINGSPEAK_API_KEY";
+
+//TELEGRAM 
+String botToken = "YOUR_TELEGRAM_BOT_TOKEN";
+String chatID = "YOUR_CHAT_ID";
+WiFiClient client;
+WiFiClientSecure secureClient;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+float baselineTemp = 0.0;
+bool baselineReady = false;
+int baselineSamples = 0;
+float prevTemp = NAN;
+int faultCount = 0;
+bool alertSent = false;
+float deviationLimit = 5.0;     // °C above baseline
+float demoAlertTemp  = 45.0;    // demo trigger
+float criticalTemp   = 60.0;    // failure temperature
+
+//TELEGRAM FUNCTION 
+void sendTelegramAlert(String message) {
+  secureClient.setInsecure();
+  HTTPClient https;
+  message.replace(" ", "%20");
+  message.replace("\n", "%0A");
+  message.replace("°", "%C2%B0");
+  String url = "https://api.telegram.org/bot" + botToken +
+               "/sendMessage?chat_id=" + chatID +
+               "&text=" + message;
+  if (https.begin(secureClient, url)) {
+    https.GET();
+    https.end();
+  }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  sensors.begin();
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  ThingSpeak.begin(client);
+}
+// ---------------- LOOP ----------------
+void loop() {
+  Serial.println("\nLOOP START ");
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  //  ignore invalid readings
+  if (tempC == DEVICE_DISCONNECTED_C || tempC == 85.0) {
+    Serial.println("Ignoring invalid sensor reading");
+    delay(15000);
+    return;
+  }
+  Serial.print("Temperature (°C): ");
+  Serial.println(tempC);
+
+  // -------- BASELINE LEARNING --------
+  if (!baselineReady && tempC < 40) {
+    baselineTemp += tempC;
+    baselineSamples++;
+    Serial.print("Learning baseline... sample ");
+    Serial.println(baselineSamples);
+
+    if (baselineSamples >= 10) {
+      baselineTemp /= baselineSamples;
+      baselineReady = true;
+      Serial.print("Baseline locked at: ");
+      Serial.println(baselineTemp);
+    }
+  }
+  // -------- RATE OF CHANGE --------
+  float rate = 0.0;
+  if (!isnan(prevTemp)) {
+    rate = tempC - prevTemp;
+  }
+  prevTemp = tempC;
+  Serial.print("Rate (°C/cycle): ");
+  Serial.println(rate);
+  // -------- ABNORMAL DETECTION --------
+  bool abnormal = false;
+  // demo mode
+  if (tempC >= demoAlertTemp) {
+    abnormal = true;
+  }
+  // digital twin logic
+  else if (baselineReady &&
+          (tempC > baselineTemp + deviationLimit || rate > 1.0)) {
+    abnormal = true;
+  }
+  faultCount = abnormal ? faultCount + 1 : 0;
+  // STATUS 
+  int status, risk;
+
+  if (faultCount == 0) {
+    status = 0; risk = 10;
+  } else if (faultCount <= 2) {
+    status = 1; risk = 50;
+  } else {
+    status = 2; risk = 90;
+  }
+
+  Serial.print("Status: ");
+  Serial.println(status);
+
+  //  TIME TO FAILURE (FIXED) 
+  float timeToFailure = -1;
+
+  if (rate > 0.2 && tempC < criticalTemp) {
+    timeToFailure = (criticalTemp - tempC) / rate;
+  } else if (tempC >= criticalTemp) {
+    timeToFailure = 0;   // already failed zone
+  }
+
+  Serial.print("Time to Failure (min): ");
+  Serial.println(timeToFailure);
+
+  // -------- TELEGRAM ALERT --------
+  if (status == 2 && !alertSent) {
+    String msg =
+      "CRITICAL MACHINE ALERT\n"
+      "Temp: " + String(tempC) + " °C\n"
+      "Baseline: " + String(baselineTemp) + " °C\n"
+      "Rate: " + String(rate) + " °C/cycle\n"
+      "Est. Failure Time: " + String(timeToFailure) + " min";
+
+    sendTelegramAlert(msg);
+    alertSent = true;
+    Serial.println("Telegram alert sent");
+  }
+
+  if (status == 0) alertSent = false;
+
+  // THINGSPEAK 
+  ThingSpeak.setField(1, tempC);
+  ThingSpeak.setField(2, status);
+  ThingSpeak.setField(3, risk);
+  ThingSpeak.setField(4, timeToFailure);
+  ThingSpeak.writeFields(channelID, writeAPIKey);
+
+  Serial.println("----- LOOP END -----");
+  delay(15000);
+}
