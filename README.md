@@ -111,10 +111,6 @@ Smart-Machine-Health-Monitoring/
 
 ---
 
-## Team
-
-CyberNova Innovators
-
 ---
 
 ## License
